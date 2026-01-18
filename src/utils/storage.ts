@@ -4,6 +4,8 @@ export const STORAGE_KEYS = {
   LOGS_BUFFER: 'telling_logs_buffer',
   FIRST_OPEN: 'telling_first_open',
   LAST_APP_VERSION: 'telling_last_app_version',
+  UPDATE_SNOOZED_UNTIL: 'telling_update_snoozed_until',
+  SNOOZED_MIN_VERSION: 'telling_snoozed_min_version',
 } as const;
 
 export async function getStorageItem(key: string): Promise<string | null> {

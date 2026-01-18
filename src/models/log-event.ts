@@ -35,6 +35,8 @@ export interface LogEvent {
   message: string;
   timestamp: string;
   stackTrace?: string;
+  /** Structured stack trace elements for better crash grouping */
+  stackTraceElements?: Array<{ file: string; line: string; method: string; column?: string; class?: string }>;
   metadata?: Record<string, unknown>;
   device?: DeviceMetadata;
   userId?: string;
@@ -64,6 +66,7 @@ export function createLogEvent(
     message: params.message,
     timestamp: params.timestamp,
     stackTrace: params.stackTrace,
+    stackTraceElements: params.stackTraceElements,
     metadata: params.metadata,
     device: params.device,
     userId: params.userId,
@@ -83,6 +86,7 @@ export function logEventToJson(event: LogEvent): Record<string, unknown> {
   };
 
   if (event.stackTrace) json.stackTrace = event.stackTrace;
+  if (event.stackTraceElements) json.stackTraceElements = event.stackTraceElements;
   if (event.metadata) json.metadata = event.metadata;
   if (event.device) json.device = event.device;
   if (event.userId) json.userId = event.userId;
@@ -101,6 +105,7 @@ export function logEventFromJson(json: Record<string, unknown>): LogEvent {
     message: (json.message as string) ?? '',
     timestamp: (json.timestamp as string) ?? new Date().toISOString(),
     stackTrace: json.stackTrace as string | undefined,
+    stackTraceElements: json.stackTraceElements as LogEvent['stackTraceElements'] | undefined,
     metadata: json.metadata as Record<string, unknown> | undefined,
     device: json.device as DeviceMetadata | undefined,
     userId: json.userId as string | undefined,

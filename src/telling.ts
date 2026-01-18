@@ -1,4 +1,4 @@
-import { AppState, AppStateStatus } from 'react-native';
+import { AppState, AppStateStatus, Platform } from 'react-native';
 import { gzip } from 'pako';
 import {
   setJSExceptionHandler,
@@ -11,6 +11,8 @@ import {
   LogType,
   DeviceMetadata,
   Session,
+  VersionCheckResult,
+  noUpdateRequired,
   createLogEvent,
   logEventToJson,
   logEventFromJson,
@@ -27,6 +29,8 @@ import {
   setStorageItem,
   getStringList,
   setStringList,
+  parseStackTrace,
+  stackFramesToJson,
 } from './utils';
 
 interface InitOptions {
@@ -82,6 +86,7 @@ class TellingLogger {
 
   private _apiKey?: string;
   private readonly _baseUrl = 'https://tellingserver.globeapp.dev/api/v1/logs';
+  private readonly _versionCheckUrl = 'https://tellingserver.globeapp.dev/api/v1/project/version-check';
   private _initialized = false;
   private _deviceMetadata?: DeviceMetadata;
   private _enableDebugLogs = false;
@@ -177,6 +182,202 @@ class TellingLogger {
     });
   }
 
+  /**
+   * Check if the app version meets the minimum requirements defined in the dashboard.
+   * Returns a VersionCheckResult indicating if an update is required.
+   */
+  async checkVersion(): Promise<VersionCheckResult> {
+    if (!this._initialized || !this._apiKey) {
+      if (this._enableDebugLogs) console.log('Telling SDK not initialized');
+      return noUpdateRequired;
+    }
+
+    const currentVersion = this._deviceMetadata?.appVersion;
+    if (!currentVersion) {
+      return noUpdateRequired;
+    }
+
+    try {
+      const platform = Platform.OS === 'ios' ? 'ios' : Platform.OS === 'android' ? 'android' : 'unknown';
+      if (platform === 'unknown') {
+        return noUpdateRequired;
+      }
+
+      const url = `${this._versionCheckUrl}?platform=${platform}&version=${currentVersion}`;
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'x-api-key': this._apiKey,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.status !== 200) {
+        if (this._enableDebugLogs) {
+          console.log(`Failed to check version: ${response.status}`);
+        }
+        return noUpdateRequired;
+      }
+
+      const data = (await response.json()) as {
+        requiresUpdate?: boolean;
+        isRequired?: boolean;
+        minVersion?: string;
+        storeUrl?: string;
+        message?: string;
+      };
+      const requiresUpdate = data.requiresUpdate ?? false;
+      const isRequired = data.isRequired ?? false;
+      const minVersion = data.minVersion;
+
+      // For non-compulsory updates, check if user has snoozed this version
+      if (requiresUpdate && !isRequired && minVersion) {
+        const isSnoozed = await this._isUpdateSnoozed(minVersion);
+        if (isSnoozed) {
+          if (this._enableDebugLogs) {
+            console.log(`Telling: Update snoozed for min version ${minVersion}`);
+          }
+          this.log('update_check_completed', {
+            level: LogLevel.Info,
+            type: LogType.Analytics,
+            metadata: {
+              requires_update: true,
+              is_required: false,
+              min_version: minVersion,
+              current_version: currentVersion,
+              is_snoozed: true,
+            },
+          });
+          return noUpdateRequired;
+        }
+      }
+
+      const result: VersionCheckResult = {
+        requiresUpdate,
+        isRequired,
+        storeUrl: data.storeUrl,
+        message: data.message,
+        minVersion,
+      };
+
+      // Log version check completion
+      this.log('update_check_completed', {
+        level: LogLevel.Info,
+        type: LogType.Analytics,
+        metadata: {
+          requires_update: result.requiresUpdate,
+          is_required: result.isRequired,
+          min_version: result.minVersion,
+          current_version: currentVersion,
+          is_snoozed: false,
+        },
+      });
+
+      // If update is required, log that user will be prompted
+      if (result.requiresUpdate) {
+        this.log('update_prompted', {
+          level: LogLevel.Info,
+          type: LogType.Analytics,
+          metadata: {
+            is_required: result.isRequired,
+            min_version: result.minVersion,
+            current_version: currentVersion,
+          },
+        });
+      }
+
+      return result;
+    } catch (e) {
+      if (this._enableDebugLogs) {
+        console.log(`Error checking version: ${e}`);
+      }
+      return noUpdateRequired;
+    }
+  }
+
+  /**
+   * Check if the user has snoozed updates for a specific min version.
+   */
+  private async _isUpdateSnoozed(minVersion: string): Promise<boolean> {
+    try {
+      const snoozedUntilStr = await getStorageItem(STORAGE_KEYS.UPDATE_SNOOZED_UNTIL);
+      const snoozedMinVersion = await getStorageItem(STORAGE_KEYS.SNOOZED_MIN_VERSION);
+
+      if (!snoozedUntilStr || !snoozedMinVersion) {
+        return false;
+      }
+
+      // Snooze only applies to the same min version
+      if (snoozedMinVersion !== minVersion) {
+        return false;
+      }
+
+      const snoozedUntil = new Date(snoozedUntilStr);
+      return new Date() < snoozedUntil;
+    } catch (e) {
+      if (this._enableDebugLogs) {
+        console.log(`Telling: Error checking snooze state: ${e}`);
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Snooze the update prompt for the specified number of days.
+   * Call this when the user taps "Later" or "Skip" on a non-compulsory update.
+   * The snooze is tied to the specific minVersion.
+   */
+  async snoozeUpdate(days: number, minVersion: string): Promise<void> {
+    // 0 or negative days = no snooze
+    if (days <= 0) {
+      if (this._enableDebugLogs) {
+        console.log('Telling: Snooze days is 0, not snoozing');
+      }
+      return;
+    }
+
+    // Clamp to max 3 days
+    const clampedDays = Math.min(Math.max(days, 1), 3);
+
+    const snoozedUntil = new Date();
+    snoozedUntil.setDate(snoozedUntil.getDate() + clampedDays);
+
+    await setStorageItem(STORAGE_KEYS.UPDATE_SNOOZED_UNTIL, snoozedUntil.toISOString());
+    await setStorageItem(STORAGE_KEYS.SNOOZED_MIN_VERSION, minVersion);
+
+    this.log('update_snoozed', {
+      level: LogLevel.Info,
+      type: LogType.Analytics,
+      metadata: {
+        snooze_days: clampedDays,
+        min_version: minVersion,
+        current_version: this._deviceMetadata?.appVersion,
+      },
+    });
+
+    if (this._enableDebugLogs) {
+      console.log(`Telling: Update snoozed until ${snoozedUntil.toISOString()} for min version ${minVersion}`);
+    }
+  }
+
+  /**
+   * Call this when the user accepts an update prompt and you're about to
+   * redirect them to the app store.
+   */
+  async acceptUpdate(minVersion?: string): Promise<void> {
+    this.log('update_accepted', {
+      level: LogLevel.Info,
+      type: LogType.Analytics,
+      metadata: {
+        min_version: minVersion,
+        current_version: this._deviceMetadata?.appVersion,
+      },
+    });
+
+    // Flush immediately to ensure event is sent before user leaves the app
+    await this._flush();
+  }
+
   enableCrashReporting(): void {
     if (!this._initialized) {
       if (this._enableDebugLogs) {
@@ -230,12 +431,23 @@ class TellingLogger {
       enrichedMetadata.breadcrumbs = [...this._breadcrumbs];
     }
 
+    // Parse stack trace into structured elements for crash logs
+    const rawStackTrace = options?.stackTrace ?? options?.error?.stack;
+    let stackTraceElements: Array<{ file: string; line: string; method: string; column?: string; class?: string }> | undefined;
+    if (rawStackTrace && type === LogType.Crash) {
+      const parsedFrames = parseStackTrace(rawStackTrace);
+      if (parsedFrames.length > 0) {
+        stackTraceElements = stackFramesToJson(parsedFrames);
+      }
+    }
+
     const event = createLogEvent({
       type,
       level,
       message,
       timestamp: new Date().toISOString(),
-      stackTrace: options?.stackTrace ?? options?.error?.stack,
+      stackTrace: rawStackTrace,
+      stackTraceElements,
       metadata: Object.keys(enrichedMetadata).length > 0 ? enrichedMetadata : undefined,
       device: this._deviceMetadata,
       userId: this._userId,

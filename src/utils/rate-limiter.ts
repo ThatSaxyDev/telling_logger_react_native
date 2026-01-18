@@ -97,4 +97,15 @@ export class LogRateLimiter {
       }
     }
   }
+
+  /**
+   * Get statistics for monitoring/debugging
+   */
+  getStats(): { cached_hashes: number; throttle_entries: number; logs_this_second: number } {
+    return {
+      cached_hashes: this._sentLogs.size,
+      throttle_entries: this._lastSentByType.size,
+      logs_this_second: this._logsThisSecond,
+    };
+  }
 }

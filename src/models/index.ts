@@ -9,3 +9,4 @@ export {
   parseLogType,
 } from './log-event';
 export { Session, getSessionDuration, isSessionActive, sessionToJson } from './session';
+export { VersionCheckResult, noUpdateRequired } from './version-check-result';
